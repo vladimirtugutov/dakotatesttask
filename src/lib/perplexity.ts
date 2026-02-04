@@ -1,6 +1,12 @@
 const API_URL = 'https://api.perplexity.ai/chat/completions'
 const API_KEY = import.meta.env.VITE_PERPLEXITY_API_KEY
 
+// Retry and timeout configuration
+const MAX_RETRIES = 3
+const INITIAL_RETRY_DELAY = 1000 // 1 second
+const REQUEST_TIMEOUT = 30000 // 30 seconds
+const RETRYABLE_STATUS_CODES = [408, 429, 500, 502, 503, 504]
+
 const SYSTEM_PROMPT = `Ты эксперт по анализу вакансий и зарплат в IT-индустрии России и СНГ.
 
 Проанализируй предоставленную вакансию и предскажи реалистичный диапазон зарплаты.
@@ -58,6 +64,76 @@ interface PerplexityStreamResponse {
 type OnChunkCallback = (chunk: string) => void
 type OnErrorCallback = (error: string) => void
 
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function fetchWithTimeout(
+  url: string,
+  options: RequestInit,
+  timeout: number
+): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => {
+      controller.abort()
+      reject(new Error(`Таймаут запроса: ${timeout}мс`))
+    }, timeout)
+
+    fetch(url, { ...options, signal: controller.signal })
+      .then(response => {
+        clearTimeout(timeoutId)
+        resolve(response)
+      })
+      .catch(error => {
+        clearTimeout(timeoutId)
+        reject(error)
+      })
+  })
+}
+
+async function fetchWithRetry(
+  url: string,
+  options: RequestInit,
+  maxRetries: number = MAX_RETRIES,
+  initialDelay: number = INITIAL_RETRY_DELAY
+): Promise<Response> {
+  let lastError: Error | null = null
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await fetchWithTimeout(url, options, REQUEST_TIMEOUT)
+
+      if (response.ok) {
+        return response
+      }
+
+      if (RETRYABLE_STATUS_CODES.includes(response.status) && attempt < maxRetries) {
+        const delay = initialDelay * Math.pow(2, attempt)
+        console.warn(`Retry ${attempt + 1}/${maxRetries} after ${delay}ms (status: ${response.status})`)
+        await sleep(delay)
+        continue
+      }
+
+      const errorText = await response.text()
+      throw new Error(`API Error: ${response.status} - ${errorText}`)
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error))
+
+      if (attempt < maxRetries && !lastError.message.includes('API Error:')) {
+        const delay = initialDelay * Math.pow(2, attempt)
+        console.warn(`Retry ${attempt + 1}/${maxRetries} after ${delay}ms (error: ${lastError.message})`)
+        await sleep(delay)
+        continue
+      }
+
+      throw lastError
+    }
+  }
+
+  throw lastError || new Error('Неизвестная ошибка')
+}
+
 export async function analyzeSalary(
   jobText: string,
   onChunk: OnChunkCallback,
@@ -74,7 +150,7 @@ export async function analyzeSalary(
       temperature: 0.7,
     }
 
-    const response = await fetch(API_URL, {
+    const response = await fetchWithRetry(API_URL, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${API_KEY}`,
@@ -82,11 +158,6 @@ export async function analyzeSalary(
       },
       body: JSON.stringify(requestBody)
     })
-
-    if (!response.ok) {
-      const error = await response.text()
-      throw new Error(`API Error: ${response.status} - ${error}`)
-    }
 
     const reader = response.body?.getReader()
     if (!reader) {
